@@ -90,9 +90,12 @@ class DnDFormGenerator:
             filterOpt = ",".join(map(lambda entry: "*" + entry, uploadField.get("expression", "").split(",")))
             self.__add_widget_property(widget, "text", None, "value", filterOpt)
             return widget
-
+        
         if editWidget.get("type") == "TextEdit":
             optMultiline = editWidget.find("config/Option/Option[@name='IsMultiline']")
+            optHtml = editWidget.find("config/Option/Option[@name='UseHtml']")
+            useHtml = optHtml is not None and optHtml.get("value") == "true"
+            self.__add_widget_property(widget, "useHtml", None, None, "true" if useHtml else "false", "property", "bool")
             className = "QLineEdit"
             if optMultiline is not None and optMultiline.get("value") == "true":
                 className = "QTextEdit"
