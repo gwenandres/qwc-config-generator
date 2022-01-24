@@ -414,6 +414,9 @@ class QGSReader:
             multilineOpt = edit_widget.find(
                         "config/Option/Option[@name='IsMultiline']")
             constraints['multiline'] = multilineOpt is not None and multilineOpt.get('value') == "true"
+            htmlOpt = edit_widget.find(
+                        "config/Option/Option[@name='UseHtml']")
+            constraints['usehtml'] = htmlOpt is not None and htmlOpt.get('value') == "true"
 
         return constraints
 
