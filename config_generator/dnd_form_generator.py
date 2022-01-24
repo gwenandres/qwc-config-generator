@@ -68,9 +68,12 @@ class DnDFormGenerator:
         widget.set("name", field)
         self.__add_widget_property(widget, "readOnly", None, None, "false" if editable else "true", "property", "bool")
         self.__add_widget_property(widget, "required", None, None, "true" if required else "false", "property", "bool")
-
+        
         if editWidget.get("type") == "TextEdit":
             optMultiline = editWidget.find("config/Option/Option[@name='IsMultiline']")
+            optHtml = editWidget.find("config/Option/Option[@name='UseHtml']")
+            useHtml = optHtml is not None and optHtml.get("value") == "true"
+            self.__add_widget_property(widget, "useHtml", None, None, "true" if useHtml else "false", "property", "bool")
             className = "QLineEdit"
             if optMultiline is not None and optMultiline.get("value") == "true":
                 className = "QTextEdit"
