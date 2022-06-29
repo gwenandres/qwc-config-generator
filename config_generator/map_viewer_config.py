@@ -5,7 +5,6 @@ import requests
 from urllib.parse import urljoin
 
 from .permissions_query import PermissionsQuery
-from .qgs_reader import QGSReader
 from .service_config import ServiceConfig
 
 
@@ -20,11 +19,17 @@ class MapViewerConfig(ServiceConfig):
     EDIT_GEOM_TYPES = {
         None: None,
         'POINT': 'Point',
+        'POINTZ': 'PointZ',
         'MULTIPOINT': 'MultiPoint',
+        'MULTIPOINTZ': 'MultiPointZ',
         'LINESTRING': 'LineString',
+        'LINESTRINGZ': 'LineStringZ',
         'MULTILINESTRING': 'MultiLineString',
+        'MULTILINESTRINGZ': 'MultiLineStringZ',
         'POLYGON': 'Polygon',
-        'MULTIPOLYGON': 'MultiPolygon'
+        'POLYGONZ': 'PolygonZ',
+        'MULTIPOLYGON': 'MultiPolygon',
+        'MULTIPOLYGONZ': 'MultiPolygonZ'
     }
 
     # lookup for edit field types:
@@ -47,26 +52,22 @@ class MapViewerConfig(ServiceConfig):
         'uuid': 'text'
     }
 
-    def __init__(self, tenant_path, generator_config, capabilities_reader,
-                 config_models, service_config, logger):
+    def __init__(self, tenant_path, generator_config, themes_reader,
+                 config_models, schema_url, service_config, logger):
         """Constructor
 
         :param str tenant_path: Path to config files of tenant
         :param obj generator_config: ConfigGenerator config
-        :param CapabilitiesReader capabilities_reader: CapabilitiesReader
+        :param CapabilitiesReader themes_reader: ThemesReader
         :param ConfigModels config_models: Helper for ORM models
+        :param str schema_url: JSON schema URL for service config
         :param obj service_config: Additional service config
         :param Logger logger: Logger
         """
-        super().__init__(
-            'mapViewer',
-            'https://github.com/qwc-services/qwc-map-viewer/raw/master/schemas/qwc-map-viewer.json',
-            service_config,
-            logger
-        )
+        super().__init__('mapViewer', schema_url, service_config, logger)
 
         self.tenant_path = tenant_path
-        self.capabilities_reader = capabilities_reader
+        self.themes_reader = themes_reader
         self.config_models = config_models
         self.permissions_query = PermissionsQuery(config_models, logger)
         # helper method alias
@@ -209,7 +210,7 @@ class MapViewerConfig(ServiceConfig):
         cfg_qwc2_themes = cfg_generator_config.get('qwc2_themes', {})
 
         # QWC2 themes config
-        themes_config = self.capabilities_reader.themes_config
+        themes_config = self.themes_reader.themes_config
         themes_config_themes = themes_config.get('themes', {})
 
         # reset theme IDs,  default theme and group counter
@@ -275,6 +276,7 @@ class MapViewerConfig(ServiceConfig):
             })
 
         themes['pluginData'] = themes_config_themes.get('pluginData', {})
+        themes['snapping'] = themes_config_themes.get('snapping', {})
         themes['themeInfoLinks'] = themes_config_themes.get(
             'themeInfoLinks', []
         )
@@ -335,13 +337,9 @@ class MapViewerConfig(ServiceConfig):
         ).rstrip('/') + '/'
 
         # get capabilities
-        service_name = self.capabilities_reader.service_name(cfg_item['url'])
-        cap = self.capabilities_reader.wms_capabilities.get(service_name)
-        if cap is None:
-            self.logger.warning(
-                "Skipping theme item '%s': Could not get capabilities for %s" %
-                (cfg_item.get('title', ""), cfg_item['url'])
-            )
+        service_name = self.themes_reader.service_name(cfg_item['url'])
+        cap = self.themes_reader.wms_capabilities(service_name)
+        if not cap:
             return None
 
         root_layer = cap.get('root_layer', {})
@@ -415,7 +413,7 @@ class MapViewerConfig(ServiceConfig):
         externalLayers = cfg_item.get("externalLayers") if "externalLayers" in cfg_item else []
         for layer in root_layer.get('layers', []):
             layers.append(self.collect_layers(
-                layer, search_layers, 1, collapseLayerGroupsBelowLevel, externalLayers))
+                layer, search_layers, 1, collapseLayerGroupsBelowLevel, externalLayers, service_name))
         item['sublayers'] = layers
         item['expanded'] = True
         item['drawingOrder'] = cap.get('drawing_order', [])
@@ -441,6 +439,7 @@ class MapViewerConfig(ServiceConfig):
 
         self.set_optional_config(cfg_item, 'printLabelConfig', item)
         self.set_optional_config(cfg_item, 'printLabelForSearchResult', item)
+        self.set_optional_config(cfg_item, 'printLabelForAttribution', item)
 
         self.set_optional_config(cfg_item, 'extraLegendParameters', item)
 
@@ -463,6 +462,7 @@ class MapViewerConfig(ServiceConfig):
         self.set_optional_config(cfg_item, 'mapTips', item)
         self.set_optional_config(cfg_item, 'userMap', item)
         self.set_optional_config(cfg_item, 'pluginData', item)
+        self.set_optional_config(cfg_item, 'snapping', item)
         self.set_optional_config(cfg_item, 'themeInfoLinks', item)
 
         # TODO: generate thumbnail
@@ -618,7 +618,7 @@ class MapViewerConfig(ServiceConfig):
         if field in cfg_item:
             item[field] = cfg_item.get(field)
 
-    def collect_layers(self, layer, search_layers, level, collapseBelowLevel, externalLayers):
+    def collect_layers(self, layer, search_layers, level, collapseBelowLevel, externalLayers, service_name):
         """Recursively collect layer tree from capabilities.
 
         :param obj layer: Layer or group layer
@@ -637,7 +637,7 @@ class MapViewerConfig(ServiceConfig):
             for sublayer in layer['layers']:
                 # recursively collect sub layer
                 sublayers.append(self.collect_layers(
-                    sublayer, search_layers, level + 1, collapseBelowLevel, externalLayers))
+                    sublayer, search_layers, level + 1, collapseBelowLevel, externalLayers, service_name))
 
             # abstract
             if 'abstract' in layer:
@@ -681,6 +681,18 @@ class MapViewerConfig(ServiceConfig):
 
             if 'dimensions' in layer:
                 item_layer["dimensions"] = layer.get('dimensions')
+                # Fallback for pre qgis-3.26.0
+                meta = None
+                for dimension in item_layer["dimensions"]:
+                    if not dimension["fieldName"]:
+                        if not meta:
+                            meta = self.themes_reader.layer_metadata(service_name, layer['name'])
+                            if not meta or 'dimensions' not in meta:
+                                break
+                        dimmeta = meta['dimensions']
+                        if dimension['name'] in dimmeta:
+                            dimension["fieldName"] = dimmeta[dimension['name']]["fieldName"]
+                            dimension["endFieldName"] = dimmeta[dimension['name']]["endFieldName"]
 
             # abstract
             if 'abstract' in layer:
@@ -744,14 +756,28 @@ class MapViewerConfig(ServiceConfig):
         ]
         datasets_query = session.query(Permission) \
             .join(Permission.resource) \
-            .filter(Permission.write) \
             .filter(Resource.parent_id == map_obj.id) \
             .filter(Resource.type.in_(resource_types)) \
-            .distinct(Resource.name) \
+            .distinct(Resource.name, Resource.type) \
             .order_by(Resource.name)
-        edit_datasets = [
-            permission.resource.name for permission in datasets_query.all()
-        ]
+
+        edit_datasets = {}
+        for permission in datasets_query.all():
+            writeable = permission.write
+            creatable = writeable and permission.resource.type in ['data', 'data_create']
+            updatable = writeable and permission.resource.type in ['data', 'data_update']
+            deletable = writeable and permission.resource.type in ['data', 'data_delete']
+
+            if permission.resource.name in edit_datasets :
+                creatable |= edit_datasets[permission.resource.name]['creatable']
+                updatable |= edit_datasets[permission.resource.name]['updatable']
+                deletable |= edit_datasets[permission.resource.name]['deletable']
+
+            edit_datasets[permission.resource.name] = {
+                'creatable' : creatable,
+                'updatable' : updatable,
+                'deletable' : deletable
+            }
 
         session.close()
 
@@ -759,87 +785,83 @@ class MapViewerConfig(ServiceConfig):
             # no edit datasets for this map
             return edit_config
 
-        qgs_reader = QGSReader(self.logger, self.qgis_projects_base_dir)
-        self.logger.info("Reading '%s.qgs'" % map_name)
-        if qgs_reader.read(map_name):
+        # Collect ui forms
+        forms = self.themes_reader.collect_ui_forms(map_name, self.qwc_base_dir, edit_datasets)
 
-            # Collect ui forms
-            forms = qgs_reader.collect_ui_forms(self.qwc_base_dir)
+        # collect edit datasets
+        for layer_name in self.themes_reader.pg_layers(map_name):
+            if layer_name not in edit_datasets:
+                # skip layers not in datasets
+                continue
 
-            # collect edit datasets
-            for layer_name in qgs_reader.pg_layers():
-                if layer_name not in edit_datasets:
-                    # skip layers not in datasets
+            dataset_name = "%s.%s" % (map_name, layer_name)
+
+            try:
+                # get layer metadata from QGIS project
+                meta = self.themes_reader.layer_metadata(map_name, layer_name)
+            except Exception as e:
+                self.logger.error(
+                    "Could not get metadata for edit dataset '%s':\n%s" %
+                    (dataset_name, e)
+                )
+                continue
+
+            # check geometry type
+            if not 'geometry_type' in meta or meta['geometry_type'] not in self.EDIT_GEOM_TYPES:
+                table = (
+                    "%s.%s" % (meta.get('schema'), meta.get('table_name'))
+                )
+                self.logger.warning(
+                    "Unsupported geometry type '%s' for edit dataset '%s' "
+                    "on table '%s'" %
+                    (meta.get('geometry_type', None), dataset_name, table)
+                )
+                continue
+
+            # NOTE: use ordered keys
+            dataset = OrderedDict()
+            dataset['layerName'] = layer_name
+            dataset['editDataset'] = dataset_name
+            dataset['geomType'] = self.EDIT_GEOM_TYPES.get(
+                meta['geometry_type']
+            )
+            dataset['permissions'] = edit_datasets[layer_name]
+
+            if layer_name in forms:
+                dataset['form'] = forms[layer_name]
+
+            # collect fields
+            fields = []
+            for attr in meta.get('attributes'):
+                field = meta['fields'].get(attr, {})
+
+                if field.get('expression'):
+                    # Skip expression field
                     continue
 
-                dataset_name = "%s.%s" % (map_name, layer_name)
-
-                try:
-                    # get layer metadata from QGIS project
-                    meta = qgs_reader.layer_metadata(layer_name)
-                    qgs_reader.lookup_attribute_data_types(meta)
-                except Exception as e:
-                    self.logger.error(
-                        "Could not get metadata for edit dataset '%s':\n%s" %
-                        (dataset_name, e)
-                    )
-                    continue
-
-                # check geometry type
-                if not 'geometry_type' in meta or meta['geometry_type'] not in self.EDIT_GEOM_TYPES:
-                    table = (
-                        "%s.%s" % (meta.get('schema'), meta.get('table_name'))
-                    )
-                    self.logger.warning(
-                        "Unsupported geometry type '%s' for edit dataset '%s' "
-                        "on table '%s'" %
-                        (meta.get('geometry_type', None), dataset_name, table)
-                    )
-                    continue
-
-                # NOTE: use ordered keys
-                dataset = OrderedDict()
-                dataset['layerName'] = layer_name
-                dataset['editDataset'] = dataset_name
-                dataset['geomType'] = self.EDIT_GEOM_TYPES.get(
-                    meta['geometry_type']
+                alias = field.get('alias', attr)
+                data_type = self.EDIT_FIELD_TYPES.get(
+                    field.get('data_type'), 'text'
                 )
 
-                if layer_name in forms:
-                    dataset['form'] = forms[layer_name]
+                # NOTE: use ordered keys
+                edit_field = OrderedDict()
+                edit_field['id'] = attr
+                edit_field['name'] = alias
+                edit_field['type'] = data_type
 
-                # collect fields
-                fields = []
-                for attr in meta.get('attributes'):
-                    field = meta['fields'].get(attr, {})
+                if 'constraints' in field:
+                    # add any constraints
+                    edit_field['constraints'] = field['constraints']
+                    if 'values' in field['constraints']:
+                        edit_field['type'] = 'list'
 
-                    if field.get('expression'):
-                        # Skip expression field
-                        continue
+                fields.append(edit_field)
 
-                    alias = field.get('alias', attr)
-                    data_type = self.EDIT_FIELD_TYPES.get(
-                        field.get('data_type'), 'text'
-                    )
-
-                    # NOTE: use ordered keys
-                    edit_field = OrderedDict()
-                    edit_field['id'] = attr
-                    edit_field['name'] = alias
-                    edit_field['type'] = data_type
-
-                    if 'constraints' in field:
-                        # add any constraints
-                        edit_field['constraints'] = field['constraints']
-                        if 'values' in field['constraints']:
-                            edit_field['type'] = 'list'
-
-                    fields.append(edit_field)
-
-                dataset['fields'] = fields
+            dataset['fields'] = fields
 
 
-                edit_config[layer_name] = dataset
+            edit_config[layer_name] = dataset
 
         # Preserve manually specified edit configs
         if 'editConfig' in cfg_item:
@@ -887,7 +909,7 @@ class MapViewerConfig(ServiceConfig):
             return []
 
         # QWC2 themes config
-        themes_config = self.capabilities_reader.themes_config
+        themes_config = self.themes_reader.themes_config
         themes_config_themes = themes_config.get('themes', {})
 
         for bg_layer in themes_config_themes.get('backgroundLayers', []):

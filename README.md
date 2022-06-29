@@ -29,7 +29,8 @@ Example `tenantConfig.json`:
     "qgis_projects_scan_base_dir": "/data/scan",
     "qgis_projects_gen_base_dir": "/data/gen",
     "permissions_default_allow": true,
-    "validate_schema": true
+    "validate_schema": true,
+    "autogen_keyvaltable_datasets": false
   },
   "themesConfig": {
       "defaultScales": [100000000, 50000000, 25000000, 10000000, 4000000, 2000000, 1000000, 400000, 200000, 80000, 40000, 20000, 10000, 8000, 6000, 4000, 2000, 1000, 500, 250, 100],
@@ -260,7 +261,7 @@ The config generator also has the ability to split a layer, that has been [class
 
 ### Schema validation
 
-By default, the config-generator will validate the service configurations in `tenantConfig.json` against the schema definition of the service. This requires network access to `raw.githubusercontent.com`. You can disable the schema validation by setting `"validate_schema": false` in config-generator `config` block in `tenantConfig.json`.
+By default, the config-generator will validate the service configurations in `tenantConfig.json` against the schema definition of the service. The JSON Schemas are loaded from local files in `JSON_SCHEMAS_PATH`, or else downloaded from https://github.com/qwc-services/ if no schema files are present. You can disable the schema validation by setting `"validate_schema": false` in config-generator `config` block in `tenantConfig.json`.
 
 ### Permissions
 
@@ -313,6 +314,15 @@ Base URL:
 Generate both service configs and permissions for `default` tenant:
 
     curl -X POST "http://localhost:5010/generate_configs?tenant=default"
+
+### Update JSON schemas
+
+Optionally change the `JSON_SCHEMAS_PATH` environment variable to the target dir for JSON schemas (default `/tmp/`).
+Optionally change schema URLs in [schema-versions.json](schemas/schema-versions.json) to desired versions (default: current `master`).
+
+Download JSON schemas:
+
+    python download_json_schemas.py
 
 
 Development

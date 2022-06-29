@@ -1,16 +1,18 @@
-from collections import OrderedDict
-from datetime import datetime
 import json
+import jsonschema
 import os
-from shutil import copyfile, rmtree
+import requests
 import tempfile
 
-import jsonschema
-import requests
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+from shutil import move, copyfile, rmtree
+from urllib.parse import urljoin, urlparse
 
 from qwc_services_core.config_models import ConfigModels
 from qwc_services_core.database import DatabaseEngine
-from .capabilities_reader import CapabilitiesReader
+from .theme_reader import ThemeReader
 from .data_service_config import DataServiceConfig
 from .ext_service_config import ExtServiceConfig
 from .feature_info_service_config import FeatureInfoServiceConfig
@@ -117,7 +119,7 @@ class ConfigGenerator():
     """ConfigGenerator class
 
     Generate JSON files for service configs and permissions
-    from a themesConfig.json, WMS GetCapabilities and QWC ConfigDB.
+    from a tenantConfig.json and QWC ConfigDB.
     """
 
     def __init__(self, config, logger):
@@ -132,6 +134,12 @@ class ConfigGenerator():
         generator_config = config.get('config', {})
         self.tenant = generator_config.get('tenant', 'default')
         self.logger.debug("Using tenant '%s'" % self.tenant)
+
+        # get default QGIS server URL from ConfigGenerator config
+        self.default_qgis_server_url = generator_config.get(
+            'default_qgis_server_url', 'http://localhost:8001/ows/'
+        ).rstrip('/') + '/'
+
         # Set output config path for the generated configuration files.
         # If `config_path` is not set in the configGeneratorConfig.json,
         # then either use the `OUTPUT_CONFIG_PATH` ENV variable (if it is set)
@@ -167,80 +175,110 @@ class ConfigGenerator():
             self.logger.error(msg)
             raise Exception(msg)
 
-        # load capabilites for all QWC2 theme items
-        self.capabilities_reader = CapabilitiesReader(
-            generator_config, config.get("themesConfig"), self.logger
+        themes_config = config.get("themesConfig", {})
+
+        # Preprocess QGS projects
+        self.preprocess_qgs_projects(generator_config, self.tenant)
+
+        # Search for QGS projects in scan dir and automatically generate theme items
+        self.search_qgs_projects(generator_config, themes_config)
+
+        # load metadata for all QWC2 theme items
+        self.theme_reader = ThemeReader(
+            generator_config, themes_config, self.logger
         )
-        self.capabilities_reader.preprocess_qgs_projects(
-            generator_config, self.tenant)
-        self.capabilities_reader.search_qgs_projects(
-            generator_config)
-        self.capabilities_reader.load_all_project_settings()
 
         # lookup for additional service configs by name
         self.service_configs = {}
         for service_config in self.config.get('services', []):
             self.service_configs[service_config['name']] = service_config
 
+        # load schema-versions.json
+        schema_versions = {}
+        schema_versions_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            '../schemas/schema-versions.json'
+        )
+        try:
+            with open(schema_versions_path) as f:
+                schema_versions = json.load(f)
+        except Exception as e:
+            msg = (
+                "Could not load JSON schema versions from %s:\n%s" %
+                (schema_versions_path, e)
+            )
+            self.logger.error(msg)
+            raise Exception(msg)
+
+        # lookup for JSON schema URLs by service name
+        self.schema_urls = {}
+        for schema in schema_versions.get('schemas', []):
+            self.schema_urls[schema.get('service')] = schema.get('schema_url', '')
+
+        # get path to downloaded JSON schema files
+        self.json_schemas_path = os.environ.get('JSON_SCHEMAS_PATH', '/tmp/')
+
         # create service config handlers
         self.config_handler = {
             # services with resources
             'ogc': OGCServiceConfig(
-                generator_config, self.capabilities_reader, self.config_models,
-                self.service_config('ogc'), self.logger
+                generator_config, self.theme_reader, self.config_models,
+                self.schema_urls.get('ogc'), self.service_config('ogc'),
+                self.logger
             ),
             'mapViewer': MapViewerConfig(
                 self.temp_tenant_path,
-                generator_config, self.capabilities_reader, self.config_models,
+                generator_config, self.theme_reader, self.config_models,
+                self.schema_urls.get('mapViewer'),
                 self.service_config('mapViewer'), self.logger
             ),
             'featureInfo': FeatureInfoServiceConfig(
-                generator_config, self.capabilities_reader, self.config_models,
+                generator_config, self.theme_reader, self.config_models,
+                self.schema_urls.get('featureInfo'),
                 self.service_config('featureInfo'), self.logger
             ),
             'print': PrintServiceConfig(
-                self.capabilities_reader,
+                self.theme_reader, self.schema_urls.get('print'),
                 self.service_config('print'), self.logger
             ),
             'search': SearchServiceConfig(
-                self.config_models, self.service_config('search'), self.logger
+                self.config_models, self.schema_urls.get('search'),
+                self.service_config('search'), self.logger
             ),
             'legend': LegendServiceConfig(
-                generator_config, self.capabilities_reader, self.config_models,
-                self.service_config('legend'), self.logger
+                generator_config, self.theme_reader, self.config_models,
+                self.schema_urls.get('legend'), self.service_config('legend'),
+                self.logger
             ),
             'data': DataServiceConfig(
-                self.service_config('data'), generator_config,
-                self.config_models, self.logger
+                generator_config, self.theme_reader, self.config_models,
+                self.schema_urls.get('data'), self.service_config('data'),
+                self.logger
             ),
             'ext': ExtServiceConfig(
-                self.config_models, self.service_config('ext'), self.logger
+                self.config_models, self.schema_urls.get('ext'),
+                self.service_config('ext'), self.logger
             ),
 
             # config-only services
             'adminGui': ServiceConfig(
-                'adminGui',
-                'https://github.com/qwc-services/qwc-admin-gui/raw/master/schemas/qwc-admin-gui.json',
+                'adminGui', self.schema_urls.get('adminGui'),
                 self.service_config('adminGui'), self.logger, 'admin-gui'
             ),
             'dbAuth': ServiceConfig(
-                'dbAuth',
-                'https://github.com/qwc-services/qwc-db-auth/raw/master/schemas/qwc-db-auth.json',
+                'dbAuth', self.schema_urls.get('dbAuth'),
                 self.service_config('dbAuth'), self.logger, 'db-auth'
             ),
             'elevation': ServiceConfig(
-                'elevation',
-                'https://github.com/qwc-services/qwc-elevation-service/raw/master/schemas/qwc-elevation-service.json',
+                'elevation', self.schema_urls.get('elevation'),
                 self.service_config('elevation'), self.logger
             ),
             'mapinfo': ServiceConfig(
-                'mapinfo',
-                'https://github.com/qwc-services/qwc-mapinfo-service/raw/master/schemas/qwc-mapinfo-service.json',
+                'mapinfo', self.schema_urls.get('mapinfo'),
                 self.service_config('mapinfo'), self.logger
             ),
             'permalink': ServiceConfig(
-                'permalink',
-                'https://github.com/qwc-services/qwc-permalink-service/raw/master/schemas/qwc-permalink-service.json',
+                'permalink', self.schema_urls.get('permalink'),
                 self.service_config('permalink'), self.logger
             )
         }
@@ -333,7 +371,10 @@ class ConfigGenerator():
 
         Return True if the service permissions could be generated.
         """
-        permissions_config = PermissionsConfig(self.config_models, self.logger)
+        permissions_config = PermissionsConfig(
+            self.config_models, self.schema_urls.get('permissions'),
+            self.logger
+        )
         permissions_query = PermissionsQuery(self.config_models, self.logger)
         permissions = permissions_config.base_config()
 
@@ -434,53 +475,44 @@ class ConfigGenerator():
             self.logger.debug("Skipping schema validation")
             return True
 
-        # download JSON schema
+        # load local JSON schema file
+        schema = None
         try:
-            response = requests.get(schema_url)
+            # parse schema URL
+            file_name = os.path.basename(urlparse(schema_url).path)
+            file_path = os.path.join(self.json_schemas_path, file_name)
+            with open(file_path) as f:
+                schema = json.load(f)
         except Exception as e:
-            self.logger.error(
-                "Could not download JSON schema from %s:\n%s" %
-                (schema_url, str(e))
+            self.logger.warning(
+                "Could not load JSON schema from %s:\n%s" % (file_path, e)
             )
-            return False
 
-        if response.status_code != requests.codes.ok:
-            self.logger.error(
-                "Could not download JSON schema from %s:\n%s" %
-                (schema_url, response.text)
-            )
-            return False
+        if not schema:
+            # download JSON schema
+            self.logger.info("Downloading JSON schema from %s" % schema_url)
+            try:
+                response = requests.get(schema_url)
+            except Exception as e:
+                self.logger.error(
+                    "Could not download JSON schema from %s:\n%s" %
+                    (schema_url, str(e))
+                )
+                return False
 
-        # parse JSON
-        try:
-            schema = json.loads(response.text)
-        except Exception as e:
-            self.logger.error("Could not parse JSON schema:\n%s" % e)
-            return False
+            if response.status_code != requests.codes.ok:
+                self.logger.error(
+                    "Could not download JSON schema from %s:\n%s" %
+                    (schema_url, response.text)
+                )
+                return False
 
-        # FIXME: remove external schema refs from MapViewer schema for now
-        #        until QWC2 JSON schemas are available
-        if config.get('service') == 'map-viewer':
-            self.logger.info(
-                "Skipping JSON schema check for MapViewer"
-            )
-            resources = schema['properties']['resources']['properties']
-            # QWC2 application configuration as simple dict
-            resources['qwc2_config']['properties']['config'] = {
-                'type': 'object'
-            }
-            # QWC2 themes configuration as simple dict with 'themes'
-            resources['qwc2_themes'] = {
-                'type': 'object',
-                'properties': {
-                    'themes': {
-                        'type': 'object'
-                    }
-                },
-                'required': [
-                    'themes'
-                ]
-            }
+            # parse JSON
+            try:
+                schema = json.loads(response.text)
+            except Exception as e:
+                self.logger.error("Could not parse JSON schema:\n%s" % e)
+                return False
 
         # validate against schema
         valid = True
@@ -540,12 +572,170 @@ class ConfigGenerator():
 
         return valid
 
+    def preprocess_qgs_projects(self, generator_config, tenant):
+        config_in_path = os.environ.get(
+            'INPUT_CONFIG_PATH', 'config-in/'
+        )
+
+        if os.path.exists(config_in_path) is False:
+            self.logger.warning(
+                "The specified path does not exist: " + config_in_path)
+            return
+
+        qgs_projects_dir = os.path.join(
+            config_in_path, tenant, "qgis_projects")
+        if os.path.exists(qgs_projects_dir):
+            self.logger.info(
+                "Searching for projects files in " + qgs_projects_dir)
+        else:
+            self.logger.debug(
+                "The qgis_projects sub directory does not exist: " +
+                qgs_projects_dir)
+            return
+
+        # Output directory for processed projects
+        qgis_projects_gen_base_dir = generator_config.get(
+            'qgis_projects_gen_base_dir')
+        if not qgis_projects_gen_base_dir:
+            self.logger.warning("Skipping preprocessing qgis projects in " +
+                                qgs_projects_dir +
+                                ": qgis_projects_gen_base_dir is not set")
+            return
+
+        for dirpath, dirs, files in os.walk(qgs_projects_dir,
+                                            followlinks=True):
+            for filename in files:
+                if Path(filename).suffix in [".qgs", ".qgz"]:
+                    fname = os.path.join(dirpath, filename)
+                    relpath = os.path.relpath(fname, qgs_projects_dir)
+                    self.logger.info("Processing " + fname)
+
+                    # convert project
+                    dest_path = os.path.join(
+                        qgis_projects_gen_base_dir, relpath)
+
+                    if generator_config.get('split_categorized_layers', False) is True:
+                        from .categorize_groups_script import split_categorized_layers
+                        split_categorized_layers(fname, dest_path)
+                    else:
+                        copyfile(fname, dest_path)
+                    if not os.path.exists(dest_path):
+                        self.logger.warning(
+                            "The project: " + dest_path +
+                            " could not be generated.\n"
+                            "Please check if needed permissions to create the"
+                            " file are granted.")
+                        continue
+                    self.logger.info("Written to " + dest_path)
+
+    def search_qgs_projects(self, generator_config, themes_config):
+
+        qgis_projects_base_dir = generator_config.get(
+            'qgis_projects_base_dir')
+        qgis_projects_scan_base_dir = generator_config.get(
+            'qgis_projects_scan_base_dir')
+        qwc_base_dir = generator_config.get("qwc2_base_dir")
+
+        if not qgis_projects_scan_base_dir:
+            self.logger.info(
+                "Skipping scanning for projects" +
+                " (qgis_projects_scan_base_dir not set)")
+            return
+
+        if os.path.exists(qgis_projects_scan_base_dir):
+            self.logger.info(
+                "Searching for projects files in " + qgis_projects_scan_base_dir)
+        else:
+            self.logger.error(
+                "The qgis_projects_scan_base_dir sub directory" +
+                " does not exist: " + qgis_projects_scan_base_dir)
+            return
+
+        # collect existing item urls
+        items = themes_config.get("themes", {}).get(
+            "items", {})
+        wms_urls = []
+        has_default = False
+        for item in items:
+            if item.get("url"):
+                wms_urls.append(item["url"])
+            if item.get("default", False):
+                has_default = True
+
+        # This is needed because we don't want to
+        # print the error message "thumbnail dir not found"
+        # multiple times
+        thumbnail_dir_exists = True
+        thumbnail_directory = ""
+        if qwc_base_dir is None:
+            thumbnail_dir_exists = False
+            self.logger.info(
+                            "Skipping automatic thumbnail search "
+                            "(qwc2_base_dir was not set)")
+        else:
+            thumbnail_directory = os.path.join(
+                qwc_base_dir, "assets/img/mapthumbs")
+
+        for dirpath, dirs, files in os.walk(qgis_projects_scan_base_dir,
+                                            followlinks=True):
+            for filename in files:
+                if Path(filename).suffix in [".qgs", ".qgz"]:
+                    fname = os.path.join(dirpath, filename)
+                    relpath = os.path.relpath(dirpath,
+                                              qgis_projects_base_dir)
+                    wmspath = os.path.join(relpath, Path(filename).stem)
+                    wmsurlpath = urlparse(urljoin(self.default_qgis_server_url, wmspath)).path
+
+                    # Add to themes items
+                    item = OrderedDict()
+                    item["url"] = wmsurlpath
+                    item["backgroundLayers"] = themes_config.get(
+                        "defaultBackgroundLayers", [])
+                    item["searchProviders"] = themes_config.get(
+                        "defaultSearchProviders", [])
+                    item["mapCrs"] = themes_config.get(
+                        "defaultMapCrs")
+
+                    # Check if thumbnail directory exists
+                    if thumbnail_dir_exists and not os.path.exists(
+                            thumbnail_directory):
+                        self.logger.info(
+                            "Thumbnail directory: %s does not exist" % (
+                                thumbnail_directory))
+                        thumbnail_dir_exists = False
+
+                    # Scanning for thumbnail
+                    if thumbnail_dir_exists:
+                        thumbnail_filename = "%s.png" % Path(filename).stem
+                        self.logger.info("Scanning for thumbnail(%s) under %s" % (
+                            thumbnail_filename, thumbnail_directory))
+                        thumbnail_path = os.path.join(
+                                thumbnail_directory, thumbnail_filename)
+
+                        if os.path.exists(thumbnail_path):
+                            self.logger.info("Thumbnail: %s was found" % (
+                                thumbnail_filename))
+                            item["thumbnail"] = thumbnail_filename
+                        else:
+                            self.logger.info(
+                                "Thumbnail: %s could not be found under %s" % (
+                                    thumbnail_filename, thumbnail_path))
+
+                    if item["url"] not in wms_urls:
+                        self.logger.info("Adding project " + fname)
+                        if not has_default:
+                            item["default"] = True
+                            has_default = True
+                        items.append(item)
+                    else:
+                        self.logger.info("Skipping project " + fname)
+
     def get_logger(self):
         return self.logger
 
     def maps(self):
         """Return list of map names from QWC2 theme items."""
-        return self.capabilities_reader.wms_service_names()
+        return self.theme_reader.wms_service_names()
 
     def map_details(self, map_name, with_attributes=False):
         """Return details for a map from capabilities
@@ -557,10 +747,11 @@ class ConfigGenerator():
         map_details['layers'] = []
 
         # find map in capabilities
-        cap = self.capabilities_reader.wms_capabilities.get(map_name)
-        if cap is None:
+        theme_metadata = self.theme_reader.theme_metadata.get(map_name)
+        if theme_metadata is None:
             map_details['error'] = "Map not found"
         else:
+            cap = theme_metadata['wms_capabilities']
             # collect list of layer names
             root_layer = cap.get('root_layer', {})
             if with_attributes is False:

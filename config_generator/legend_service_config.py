@@ -13,22 +13,18 @@ class LegendServiceConfig(ServiceConfig):
     Generate legend service config and permissions.
     """
 
-    def __init__(self, generator_config, capabilities_reader, config_models,
-                 service_config, logger):
+    def __init__(self, generator_config, themes_reader, config_models,
+                 schema_url, service_config, logger):
         """Constructor
 
         :param obj generator_config: ConfigGenerator config
-        :param CapabilitiesReader capabilities_reader: CapabilitiesReader
+        :param CapabilitiesReader themes_reader: ThemesReader
         :param ConfigModels config_models: Helper for ORM models
+        :param str schema_url: JSON schema URL for service config
         :param obj service_config: Additional service config
         :param Logger logger: Logger
         """
-        super().__init__(
-            'legend',
-            'https://github.com/qwc-services/qwc-legend-service/raw/master/schemas/qwc-legend-service.json',
-            service_config,
-            logger
-        )
+        super().__init__('legend', schema_url, service_config, logger)
 
         # get default QGIS server URL from ConfigGenerator config
         self.default_qgis_server_url = generator_config.get(
@@ -36,7 +32,7 @@ class LegendServiceConfig(ServiceConfig):
         ).rstrip('/') + '/'
         self.legend_images_path = None
 
-        self.capabilities_reader = capabilities_reader
+        self.themes_reader = themes_reader
 
         self.config_models = config_models
         self.permissions_query = PermissionsQuery(config_models, logger)
@@ -92,8 +88,10 @@ class LegendServiceConfig(ServiceConfig):
         cfg_generator_config = self.service_config.get('generator_config', {})
         cfg_wms_services = cfg_generator_config.get('wms_services', [])
 
-        for service_name in self.capabilities_reader.wms_service_names():
-            cap = self.capabilities_reader.wms_capabilities.get(service_name)
+        for service_name in self.themes_reader.wms_service_names():
+            cap = self.themes_reader.wms_capabilities(service_name)
+            if not cap:
+                continue
 
             # NOTE: use ordered keys
             wms_service = OrderedDict()
